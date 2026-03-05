@@ -9,7 +9,7 @@ class HybridCNNDQN(nn.Module):
     논문 4.2절(Spatial Awareness Module) 및 4.3절(Decision Making Module) 구현체
     """
 
-    def __init__(self, num_actions=6, vector_dim=5):
+    def __init__(self, num_actions=7, vector_dim=5):
         super(HybridCNNDQN, self).__init__()
 
         # --- [1] 공간 인지 모듈 (Spatial Awareness Module, CNN) ---

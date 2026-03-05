@@ -23,8 +23,27 @@ def make_policy(mode, model=None, device="cpu"):
         assert model is not None
         model.eval()
 
+        if mode == "model":
+            assert model is not None
+        model.eval()
+
+        # ---- Q 디버그용 카운터 ----
+        debug_q_steps = 50   # 처음 몇 번 policy 호출까지 Q를 출력할지
+        call_cnt = 0
+        # --------------------------
+
         def _policy(obs):
-            # obs: {"image": (3,100,100), "vector": (5,)}
+            nonlocal call_cnt
+
+            img_np = obs["image"]
+            assert img_np.ndim == 3 and img_np.shape[
+                0] == 3, f"expected (3,H,W), got {img_np.shape}"
+            assert np.isfinite(img_np).all()
+            assert 0.0 <= float(img_np.min()) and float(
+                img_np.max()) <= 1.0 + 1e-6, (img_np.min(), img_np.max())
+            vec_np = obs["vector"]
+            assert np.isfinite(vec_np).all(), vec_np
+
             img = torch.from_numpy(obs["image"]).to(
                 device=device, dtype=torch.float32
             ).unsqueeze(0)
@@ -33,8 +52,25 @@ def make_policy(mode, model=None, device="cpu"):
             ).unsqueeze(0)
 
             with torch.no_grad():
-                q = model(img, vec)
-                a = int(torch.argmax(q, dim=1).item())
+                q = model(img, vec)  # (1,7)
+                q_np = q.squeeze(0).detach().cpu().numpy()
+
+                # argmax
+                a = int(np.argmax(q_np))
+
+                # ---- 디버그 출력(처음 debug_q_steps번만) ----
+                if call_cnt < debug_q_steps:
+                    topk = np.argsort(-q_np)[:3]  # 상위 3개
+                    topk_str = ", ".join([f"{i}:{q_np[i]:.4f}" for i in topk])
+
+                    # action 의미(너 env 주석 기준)
+                    # 0=stay, 1~5=GBS, 6=LEO
+                    print(f"[QDBG] call={call_cnt:03d}  Q={np.round(q_np, 4)}  "
+                          f"argmax={a}  top3={topk_str}")
+
+                call_cnt += 1
+                # ------------------------------------------
+
             return a
 
         return _policy
