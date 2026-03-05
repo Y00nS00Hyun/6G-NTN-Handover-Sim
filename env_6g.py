@@ -126,7 +126,7 @@ class Hybrid6GEnv(gym.Env):
         """단말(UE)과 LEO 위성을 dt 동안 이동시킴"""
         # 단말 이동 (맵 경계에 닿으면 튕겨나오도록 반사)
         dx = self.ue_velocity * np.cos(self.ue_direction) * self.dt
-        dy = self.ue_velocity * np.np.sin(self.ue_direction) * self.dt
+        dy = self.ue_velocity * np.sin(self.ue_direction) * self.dt
         self.ue_pos += np.array([dx, dy])
 
         if self.ue_pos[0] < 0 or self.ue_pos[0] >= self.map_size:
