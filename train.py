@@ -105,7 +105,7 @@ class DQNAgent:
 # 👽
 
 
-def evaluate(agent, env, episodes=10):
+def evaluate(agent, env, episodes=200):
     rlf_episodes = 0
     total_steps = 0
     rlf_steps = 0
