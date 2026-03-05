@@ -37,7 +37,7 @@ class DQNAgent:
         self.optimizer = optim.Adam(self.main_net.parameters(), lr=1e-4)
         self.gamma = 0.95
         self.batch_size = 64
-        self.memory = ReplayBuffer(capacity=100000)
+        self.memory = ReplayBuffer(capacity=10000)
 
     def select_action(self, state, epsilon):
         # 안전 우선 guard(원하면 유지, 아니면 제거 가능)
@@ -102,8 +102,10 @@ class DQNAgent:
     def update_target_network(self):
         self.target_net.load_state_dict(self.main_net.state_dict())
 
+# 👽
 
-def evaluate(agent, env, episodes=200):
+
+def evaluate(agent, env, episodes=10):
     rlf_episodes = 0
     total_steps = 0
     rlf_steps = 0

@@ -5,102 +5,134 @@ from gymnasium import spaces
 
 class Hybrid6GEnv(gym.Env):
     """
-    6G 하이브리드 네트워크(NTN+GBS) 핸드오버 최적화를 위한 Custom RL 환경
-    논문 정합 포인트:
-    - Action: 0=유지, 1~5=GBS, 6=LEO
-    - HO 실행 지연: 수평 50ms(1 step), 수직 300ms(3 steps)
-    - HO 지연 구간 및 RLF 구간 처리량 0(C_t=0) 반영 (reward에서 구현)
-    - RLF: SINR < gamma_out 연속 2스텝이면 발생(T_fail=200ms)
-    - Ping-pong 억제를 위한 최소 유지시간(hold) 1초(10 steps) 제공(환경 레벨)
+    6G Hybrid (GBS + LEO) handover RL environment with:
+      - pending handover execution delay (D_HO)
+      - Ct = 0 during HO execution window and RLF window
+      - HSR measurement with success timer (T_succ)
+      - Action space: 7 actions (0=stay, 1~5=GBS nodes, 6=LEO)
+    Internal node indexing:
+      - node 0: LEO
+      - node 1: Macro
+      - node 2~5: Small cells
     """
     metadata = {"render_modes": ["human"], "render_fps": 10}
 
-    def __init__(self):
+    def __init__(self, seed=None):
         super().__init__()
 
-        # --- [1] 물리적 환경 파라미터 ---
+        # -----------------------------
+        # [1] Physical / simulation params
+        # -----------------------------
         self.map_size = 5000.0
         self.grid_size = 100
         self.pixel_res = self.map_size / self.grid_size
-        self.dt = 0.1  # 100ms
+        self.dt = 0.1  # 100 ms
 
-        # 물리 노드(링크 계산용): 0=LEO, 1=Macro, 2~5=Small
-        self.num_nodes = 6
-
-        # 에이전트 행동: 0=유지, 1~5=GBS, 6=LEO
-        self.num_actions = 7
-
-        self.node_positions = np.zeros((self.num_nodes, 2))
+        # Nodes
+        self.num_nodes = 6  # (0=LEO, 1=Macro, 2..5=Small)
+        self.node_positions = np.zeros((self.num_nodes, 2), dtype=np.float32)
         self.node_positions[1] = [2500, 2500]  # Macro
         self.node_positions[2] = [1250, 1250]
         self.node_positions[3] = [3750, 1250]
         self.node_positions[4] = [1250, 3750]
         self.node_positions[5] = [3750, 3750]
 
-        self.ptx = np.array([38.0, 46.0, 30.0, 30.0, 30.0, 30.0])
-        self.noise_floor = -90.0
+        # Tx power (dBm): [LEO, Macro, Small...]
+        self.ptx = np.array(
+            [38.0, 46.0, 30.0, 30.0, 30.0, 30.0], dtype=np.float32)
+        self.noise_floor_dbm = -90.0
 
-        # RLF 임계
-        self.gamma_out = -6.0
-        self.T_fail = 0.2
+        # RLF rule params
+        self.gamma_out_db = -6.0              # RLF threshold
+        self.T_fail = 0.2                     # 200ms
         self.N_fail = int(np.ceil(self.T_fail / self.dt))  # 2 steps
 
-        # HO 비용
+        # HO execution delay params (논문 가정)
+        self.D_HO_hor = 0.05   # 50ms
+        self.D_HO_ver = 0.30   # 300ms
+        self.N_HO_hor = int(np.ceil(self.D_HO_hor / self.dt))  # typically 1
+        self.N_HO_ver = int(np.ceil(self.D_HO_ver / self.dt))  # typically 3
+
+        # HSR timer params
+        # success threshold (same as gamma_out by default)
+        self.gamma_th_db = -6.0
+        self.T_succ = 0.30        # 300ms
+        self.N_succ = int(np.ceil(self.T_succ / self.dt))  # 3 steps
+
+        # Reward weights / costs
         self.c_hor = 10.0
         self.c_ver = 50.0
         self.p_fail = 100.0
+        self.w_cap = 1.0
+        self.w_cost = 1.0
+        self.w_fail = 1.0
 
-        # HO 실행 지연 (step 단위)
-        self.D_HO_hor_steps = int(np.ceil(0.05 / self.dt))  # 50ms -> 1
-        self.D_HO_ver_steps = int(np.ceil(0.30 / self.dt))  # 300ms -> 3
+        # Shannon capacity bandwidth for Ct (논문 5.3)
+        self.B_hz = 100e6
 
-        # Ping-pong 억제용 최소 유지시간(hold) 1초
-        self.ho_hold_steps = int(np.ceil(1.0 / self.dt))  # 10 steps
-
-        # 장애물 맵
+        # Obstacles map (0..1), scaled to max 20 dB attenuation
         self.obstacle_map = np.zeros(
             (self.grid_size, self.grid_size), dtype=np.float32)
         self._generate_obstacles(num_obstacles=20)
 
-        # --- [2] 행동 및 상태 공간 ---
-        self.action_space = spaces.Discrete(self.num_actions)
+        # -----------------------------
+        # [2] Action / observation spaces
+        # -----------------------------
+        # 7 actions: 0=stay, 1..5=GBS, 6=LEO
+        self.action_space = spaces.Discrete(7)
+
         self.observation_space = spaces.Dict({
             "image": spaces.Box(low=0, high=1, shape=(3, self.grid_size, self.grid_size), dtype=np.float32),
-            "vector": spaces.Box(low=-np.inf, high=np.inf, shape=(5,), dtype=np.float32)
+            "vector": spaces.Box(low=-np.inf, high=np.inf, shape=(5,), dtype=np.float32),
         })
 
-        # --- [3] 내부 변수 ---
+        # -----------------------------
+        # [3] Internal states
+        # -----------------------------
+        self.np_random = None
+        self.seed(seed)
+
         self.current_step = 0
         self.max_steps = 10000
 
-        self.ue_pos = np.zeros(2)
+        self.ue_pos = np.zeros(2, dtype=np.float32)
         self.ue_velocity = 0.0
         self.ue_direction = 0.0
 
-        self.leo_pos = np.zeros(2)
+        self.leo_pos = np.zeros(2, dtype=np.float32)
 
-        # 현재 접속 노드(물리 노드 0~5)
-        self.current_node = 1
+        # Serving node (internal index 0..5)
+        self.serving_node = 1  # start at Macro
 
-        # RLF용 카운터
-        self.rlf_counter = 0
-
-        # HO 실행 지연 상태
-        self.pending_ho = False
-        self.pending_target_node = None  # 물리 노드(0~5)
-        self.pending_timer = 0           # 남은 지연 step
-        self.in_ho_delay = False         # 해당 스텝이 HO 지연 구간인지
-
-        # Ping-pong 억제용 hold 타이머
-        self.ho_hold_timer = 0
-
-        self.trajectory_history = []
+        # SINR tracking
         self.current_sinr_db = 10.0
+        self.rlf_counter = 0
+        self.is_rlf = False
 
-        # 메트릭 계산에 도움되는 로그(선택)
-        self.ho_triggered_this_step = False
+        # Trajectory history (for channel 3)
+        self.trajectory_history = []
 
-    def _generate_obstacles(self, num_obstacles):
+        # HO pending execution
+        self.ho_pending = False
+        self.ho_pending_target = None      # internal index 0..5
+        self.ho_pending_steps_left = 0
+        self.ho_pending_type = None        # "hor" or "ver"
+        self.ho_pending_src = None
+
+        # HSR checking window after exec complete
+        self.hsr_check_active = False
+        self.hsr_check_steps_left = 0
+        self.hsr_current_is_success = True
+        self.last_ho_exec = None  # dict for last exec-complete event
+
+        # For info/debug
+        self.last_ct = 0.0
+
+    def seed(self, seed=None):
+        self.np_random, _ = gym.utils.seeding.np_random(seed)
+        return [seed]
+
+    def _generate_obstacles(self, num_obstacles=20):
         for _ in range(num_obstacles):
             x = np.random.randint(5, self.grid_size - 15)
             y = np.random.randint(5, self.grid_size - 15)
@@ -109,136 +141,232 @@ class Hybrid6GEnv(gym.Env):
             attenuation = np.random.uniform(0.5, 1.0)
             self.obstacle_map[x:x+w, y:y+h] = attenuation
 
+    # -------------------------------------------------
+    # Gym APIs
+    # -------------------------------------------------
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
+        if seed is not None:
+            self.seed(seed)
+
         self.current_step = 0
         self.rlf_counter = 0
+        self.is_rlf = False
 
-        self.pending_ho = False
-        self.pending_target_node = None
-        self.pending_timer = 0
-        self.in_ho_delay = False
-        self.ho_hold_timer = 0
-        self.ho_triggered_this_step = False
+        self.ue_pos = self.np_random.uniform(
+            0, self.map_size, size=(2,)).astype(np.float32)
+        self.ue_velocity = float(self.np_random.uniform(
+            30, 120) * (1000 / 3600))  # m/s
+        self.ue_direction = float(self.np_random.uniform(0, 2 * np.pi))
 
-        self.ue_pos = self.np_random.uniform(0, self.map_size, size=(2,))
-        self.ue_velocity = self.np_random.uniform(
-            30, 120) * (1000 / 3600)  # m/s
-        self.ue_direction = self.np_random.uniform(0, 2 * np.pi)
+        self.leo_pos = np.array([0.0, 2500.0], dtype=np.float32)
+        self.node_positions[0] = self.leo_pos
 
-        self.current_node = 1  # Macro로 시작
-        self.leo_pos = np.array([0.0, 2500.0])
+        self.serving_node = 1
+        self.current_sinr_db = 10.0
 
         self.trajectory_history = [self.ue_pos.copy() for _ in range(5)]
-        self.current_sinr_db = 10.0
+
+        # HO/HSR states
+        self.ho_pending = False
+        self.ho_pending_target = None
+        self.ho_pending_steps_left = 0
+        self.ho_pending_type = None
+        self.ho_pending_src = None
+
+        self.hsr_check_active = False
+        self.hsr_check_steps_left = 0
+        self.hsr_current_is_success = True
+        self.last_ho_exec = None
+        self.last_ct = 0.0
 
         obs = self._get_obs()
         info = {}
         return obs, info
 
-    # -------------------------
-    # 논문 정합: action 해석
-    # -------------------------
-    def _action_to_target_node(self, action: int):
-        # 0=유지
-        if action == 0:
-            return None
-        # 1~5=GBS
-        if 1 <= action <= 5:
-            return action
-        # 6=LEO
-        if action == 6:
-            return 0
-        raise ValueError(f"Invalid action: {action}")
-
-    def _calculate_ho_cost(self, target_node):
-        if target_node is None or target_node == self.current_node:
-            return 0.0
-        if target_node == 0:
-            return self.c_ver
-        return self.c_hor
-
-    def step(self, action):
+    def step(self, action: int):
         self.current_step += 1
-        self.ho_triggered_this_step = False
 
-        # 1) 모빌리티 업데이트
+        # -----------------------------
+        # 0) Basic action validation
+        # -----------------------------
+        if not isinstance(action, (int, np.integer)):
+            action = int(action)
+
+        if action < 0 or action > 6:
+            raise ValueError(
+                f"Invalid action {action}, action must be in [0..6]")
+
+        # -----------------------------
+        # 1) Mobility update
+        # -----------------------------
         self._update_mobility()
 
-        # 2) 홀드 타이머 감소
-        if self.ho_hold_timer > 0:
-            self.ho_hold_timer -= 1
+        # -----------------------------
+        # 2) Handle HO pending countdown & possible exec-complete
+        # -----------------------------
+        ho_exec_complete = False
+        ho_exec_event = None
 
-        # 3) 액션 해석
-        requested_target = self._action_to_target_node(int(action))
+        if self.ho_pending:
+            self.ho_pending_steps_left -= 1
+            if self.ho_pending_steps_left <= 0:
+                # exec complete: switch serving
+                src = int(self.ho_pending_src)
+                tgt = int(self.ho_pending_target)
 
-        cost_ho = 0.0
-        self.in_ho_delay = False
+                self.serving_node = tgt
 
-        # (A) 이미 HO 진행 중: 타이머 감소, 완료되면 전환
-        if self.pending_ho:
-            self.in_ho_delay = True
-            self.pending_timer -= 1
+                self.ho_pending = False
+                self.ho_pending_target = None
+                self.ho_pending_type = None
+                self.ho_pending_src = None
+                self.ho_pending_steps_left = 0
 
-            if self.pending_timer <= 0:
-                # 실행 완료 시점(t_exec): 물리 노드 전환
-                self.current_node = int(self.pending_target_node)
-                self.pending_ho = False
-                self.pending_target_node = None
-                self.pending_timer = 0
+                # start HSR check window
+                self.hsr_check_active = True
+                self.hsr_check_steps_left = int(self.N_succ)
+                self.hsr_current_is_success = True
 
-                # 전환 직후 최소 유지시간(핑퐁 억제)
-                self.ho_hold_timer = self.ho_hold_steps
+                ho_exec_complete = True
+                ho_exec_event = {"src": src, "tgt": tgt}
 
-        # (B) HO 진행 중 아니면: 트리거 가능
+                # store for info
+                self.last_ho_exec = ho_exec_event
+
+        # -----------------------------
+        # 3) Channel quality (SINR) & RLF判定 (serving link 기준)
+        # -----------------------------
+        self.current_sinr_db = self._calculate_sinr_db(
+            serving_node=self.serving_node)
+        self.is_rlf = self._update_rlf(self.current_sinr_db)
+
+        # -----------------------------
+        # 4) HSR check update (exec complete 이후 N_succ 동안)
+        # -----------------------------
+        ho_success_flag = None  # None if not decided this step
+        if self.hsr_check_active:
+            # check threshold
+            if self.current_sinr_db < self.gamma_th_db:
+                self.hsr_current_is_success = False
+
+            self.hsr_check_steps_left -= 1
+            if self.hsr_check_steps_left <= 0:
+                # decision point
+                ho_success_flag = bool(self.hsr_current_is_success)
+                self.hsr_check_active = False
+                self.hsr_check_steps_left = 0
+                self.hsr_current_is_success = True
+
+        # -----------------------------
+        # 5) Decide if a new HO is triggered by this action
+        #    - action==0: stay
+        #    - action==6: target = LEO (internal 0)
+        #    - action==1..5: target = same internal index
+        # Rule: if HO pending already, ignore new HO triggers (논문 일관성)
+        # -----------------------------
+        ho_triggered = False
+        ho_trigger_event = None
+        ho_cost = 0.0
+
+        if (not self.ho_pending) and (action != 0):
+            target_node = 0 if action == 6 else int(action)  # internal index
+            if target_node != self.serving_node:
+                ho_triggered = True
+                src = int(self.serving_node)
+                tgt = int(target_node)
+                ho_type = "ver" if tgt == 0 or src == 0 else "hor"
+                delay_steps = int(
+                    self.N_HO_ver) if ho_type == "ver" else int(self.N_HO_hor)
+
+                # start pending execution
+                self.ho_pending = True
+                self.ho_pending_src = src
+                self.ho_pending_target = tgt
+                self.ho_pending_type = ho_type
+                self.ho_pending_steps_left = max(delay_steps, 1)
+
+                # costs (trigger time에만 1회 부과)
+                ho_cost = self.c_ver if ho_type == "ver" else self.c_hor
+
+                ho_trigger_event = {
+                    "src": src, "tgt": tgt, "type": ho_type, "delay_steps": self.ho_pending_steps_left}
+
+        # -----------------------------
+        # 6) Ct (논문 5.3): RLF or HO execution window => Ct=0
+        # HO execution window = pending 상태인 동안
+        # -----------------------------
+        if self.is_rlf or self.ho_pending:
+            ct = 0.0
         else:
-            # 홀드 중이면 HO 트리거 금지(유지로 강제)
-            if self.ho_hold_timer > 0:
-                requested_target = None
+            sinr_linear = 10 ** (self.current_sinr_db / 10.0)
+            ct = self.B_hz * np.log2(1.0 + sinr_linear)
 
-            if requested_target is not None and requested_target != self.current_node:
-                # 트리거 수락
-                cost_ho = self._calculate_ho_cost(requested_target)
+        self.last_ct = float(ct)
 
-                delay_steps = self.D_HO_ver_steps if requested_target == 0 else self.D_HO_hor_steps
-                self.pending_ho = True
-                self.pending_target_node = int(requested_target)
-                self.pending_timer = int(delay_steps)
-                self.in_ho_delay = True
-                self.ho_triggered_this_step = True
+        # -----------------------------
+        # 7) Reward
+        # - “논문 메트릭”과 “학습 reward”는 엄밀히 동일일 필요는 없지만,
+        #   여기서는 정석적으로 Ct(정규화) 기반으로 구성
+        # -----------------------------
+        if self.is_rlf:
+            reward = -(self.w_fail * self.p_fail)
+        else:
+            # capacity reward: use log2(1+SINR) but 0 during HO pending (Ct rule과 일치)
+            if self.ho_pending:
+                cap = 0.0
+            else:
+                sinr_linear = 10 ** (self.current_sinr_db / 10.0)
+                cap = float(np.log2(1.0 + sinr_linear))
 
-        # 4) 채널 품질 및 RLF 판정(현재 붙어있는 링크 기준)
-        self.current_sinr_db, is_rlf = self._calculate_channel_quality()
+            reward = (self.w_cap * cap) - (self.w_cost * ho_cost)
 
-        # 5) 보상(논문: HO 지연 구간 및 RLF 구간 처리량 0 반영)
-        reward = self._calculate_reward(
-            self.current_sinr_db, is_rlf, cost_ho, self.in_ho_delay)
-
-        terminated = bool(is_rlf)
-        truncated = self.current_step >= self.max_steps
+        # -----------------------------
+        # 8) Termination
+        # -----------------------------
+        terminated = bool(self.is_rlf)
+        truncated = bool(self.current_step >= self.max_steps)
 
         obs = self._get_obs()
         info = {
-            "sinr": float(self.current_sinr_db),
-            "rlf": bool(is_rlf),
-            "action": int(action),
-            "current_node": int(self.current_node),
-            "in_ho_delay": bool(self.in_ho_delay),
-            "ho_triggered": bool(self.ho_triggered_this_step),
-            "pending_ho": bool(self.pending_ho),
-            "pending_timer": int(self.pending_timer),
-            "pending_target_node": -1 if self.pending_target_node is None else int(self.pending_target_node),
+            # states
+            "step": self.current_step,
+            "serving_node": int(self.serving_node),
+            "sinr_db": float(self.current_sinr_db),
+            "rlf": bool(self.is_rlf),
+            "rlf_counter": int(self.rlf_counter),
+
+            # HO pending
+            "ho_pending": bool(self.ho_pending),
+            "ho_pending_steps_left": int(self.ho_pending_steps_left) if self.ho_pending else 0,
+            "ho_pending_type": self.ho_pending_type if self.ho_pending else None,
+            "ho_pending_target": int(self.ho_pending_target) if self.ho_pending else None,
+
+            # HO events
+            "ho_triggered": bool(ho_triggered),
+            "ho_trigger": ho_trigger_event,
+            "ho_exec_complete": bool(ho_exec_complete),
+            "ho_exec": ho_exec_event,
+
+            # HSR decision (only set when window ends)
+            "ho_success_decided": (ho_success_flag is not None),
+            "ho_success": ho_success_flag,
+
+            # Ct
+            "Ct": float(self.last_ct),
         }
+
         return obs, reward, terminated, truncated, info
 
-    # ==========================================================
-    # 내부 수학/통신 로직
-    # ==========================================================
+    # -------------------------------------------------
+    # Internal logic
+    # -------------------------------------------------
     def _update_mobility(self):
         dx = self.ue_velocity * np.cos(self.ue_direction) * self.dt
         dy = self.ue_velocity * np.sin(self.ue_direction) * self.dt
-        self.ue_pos += np.array([dx, dy])
+        self.ue_pos += np.array([dx, dy], dtype=np.float32)
 
+        # reflect boundaries
         if self.ue_pos[0] < 0 or self.ue_pos[0] >= self.map_size:
             self.ue_direction = np.pi - self.ue_direction
             self.ue_pos[0] = np.clip(self.ue_pos[0], 0, self.map_size - 1)
@@ -246,108 +374,116 @@ class Hybrid6GEnv(gym.Env):
             self.ue_direction = -self.ue_direction
             self.ue_pos[1] = np.clip(self.ue_pos[1], 0, self.map_size - 1)
 
-        # LEO 이동(7.5 km/s)
+        # LEO movement (7.5 km/s along x)
         self.leo_pos[0] = (self.leo_pos[0] + 7500.0 * self.dt) % self.map_size
         self.node_positions[0] = self.leo_pos
 
-        # 궤적 업데이트
-        self.trajectory_history.pop(0)
-        self.trajectory_history.append(self.ue_pos.copy())
+        # trajectory history
+        if len(self.trajectory_history) == 0:
+            self.trajectory_history = [self.ue_pos.copy() for _ in range(5)]
+        else:
+            self.trajectory_history.pop(0)
+            self.trajectory_history.append(self.ue_pos.copy())
 
-    def _calculate_channel_quality(self):
+    def _update_rlf(self, sinr_db: float) -> bool:
+        # RLF timer: N_fail consecutive below gamma_out
+        if sinr_db < self.gamma_out_db:
+            self.rlf_counter += 1
+            if self.rlf_counter >= self.N_fail:
+                return True
+        else:
+            self.rlf_counter = 0
+        return False
+
+    def _calculate_sinr_db(self, serving_node: int) -> float:
+        # UE pixel
         px = int(np.clip(self.ue_pos[0] /
                  self.pixel_res, 0, self.grid_size - 1))
         py = int(np.clip(self.ue_pos[1] /
                  self.pixel_res, 0, self.grid_size - 1))
 
-        blockage_attenuation = self.obstacle_map[px, py] * 20.0
+        # obstacle attenuation (0..1 -> up to 20 dB)
+        blockage_atten = float(self.obstacle_map[px, py]) * 20.0
 
-        rx_power = np.zeros(self.num_nodes)
+        rx_power_dbm = np.zeros(self.num_nodes, dtype=np.float32)
+
         for i in range(self.num_nodes):
-            dist = np.linalg.norm(self.ue_pos - self.node_positions[i])
+            dist = float(np.linalg.norm(self.ue_pos - self.node_positions[i]))
             dist = max(dist, 1.0)
 
-            if i == 0:
-                slant_dist = np.sqrt(dist**2 + 600000**2)
-                pl = 32.4 + 20 * np.log10(2.0) + 20 * np.log10(slant_dist)
-                rx_power[i] = self.ptx[i] - pl
-            else:
-                pl = 32.4 + 20 * np.log10(2.0) + 31.9 * np.log10(dist)
-                rx_power[i] = self.ptx[i] - pl - blockage_attenuation
+        f_hz = 2.0e9
+        c = 3.0e8
 
-        rx_linear = 10 ** (rx_power / 10.0)
-        noise_linear = 10 ** (self.noise_floor / 10.0)
-
-        target_signal = rx_linear[self.current_node]
-        interference = np.sum(rx_linear) - target_signal
-
-        sinr_linear = target_signal / (interference + noise_linear)
-        current_sinr_db = 10 * np.log10(sinr_linear)
-
-        # RLF 판정: SINR < gamma_out 연속 N_fail 스텝
-        is_rlf = False
-        if current_sinr_db < self.gamma_out:
-            self.rlf_counter += 1
-            if self.rlf_counter >= self.N_fail:
-                is_rlf = True
+        if i == 0:
+            # LEO: FSPL + altitude 600 km
+            slant_dist_m = np.sqrt(dist**2 + 600000.0**2)  # meters
+            fspl_db = 20.0 * np.log10(4.0 * np.pi * slant_dist_m * f_hz / c)
+            rx_power_dbm[i] = self.ptx[i] - fspl_db
         else:
-            self.rlf_counter = 0
+            # GBS: FSPL + 추가 감쇠(도심) + blockage
+            # (여기서 15dB는 도심 NLoS 성향을 약하게 반영하는 상수. 필요하면 0~30에서 튜닝)
+            fspl_db = 20.0 * np.log10(4.0 * np.pi * dist * f_hz / c)
+            rx_power_dbm[i] = self.ptx[i] - (fspl_db + 15.0 + blockage_atten)
+            rx_linear = 10 ** (rx_power_dbm / 10.0)  # mW
+            noise_linear = 10 ** (self.noise_floor_dbm / 10.0)
 
-        return float(current_sinr_db), bool(is_rlf)
-
-    def _calculate_reward(self, sinr_db, is_rlf, cost_ho, in_ho_delay=False):
-        w1, w2, w3 = 1.0, 1.0, 1.0
-
-        if is_rlf:
-            return - (w3 * self.p_fail)
-
-        # 논문: HO 지연 구간은 처리량 0
-        if in_ho_delay:
-            r_cap = 0.0
+        s = rx_linear[int(serving_node)]
+        if int(serving_node) == 0:
+            # LEO serving: 현재 구현은 위성 1개뿐이라 간섭 0으로 둠
+            i = 0.0
         else:
-            sinr_linear = 10 ** (sinr_db / 10.0)
-            r_cap = np.log2(1 + sinr_linear)
+            # GBS serving: 다른 GBS만 간섭으로 합산
+            i = float(np.sum(rx_linear[1:]) - s)
 
-        return (w1 * r_cap) - (w2 * cost_ho)
+        sinr_linear = float(s / (i + noise_linear + 1e-12))
+        sinr_db = 10.0 * np.log10(sinr_linear + 1e-12)
+        return float(sinr_db)
 
     def _get_obs(self):
-        image_tensor = np.zeros(
-            (3, self.grid_size, self.grid_size), dtype=np.float32)
+        image = np.zeros((3, self.grid_size, self.grid_size), dtype=np.float32)
 
-        # 채널 1: 장애물+인프라
-        image_tensor[0] = self.obstacle_map.copy()
+        # ch1: obstacles + GBS infra marks
+        image[0] = self.obstacle_map.copy()
         for i in range(1, self.num_nodes):
             px = int(
                 np.clip(self.node_positions[i][0] / self.pixel_res, 0, self.grid_size - 1))
             py = int(
                 np.clip(self.node_positions[i][1] / self.pixel_res, 0, self.grid_size - 1))
-            image_tensor[0, px, py] = 1.0
+            image[0, px, py] = 1.0
 
-        # 채널 2: LEO footprint
-        l_px = int(np.clip(self.leo_pos[0] /
-                   self.pixel_res, 0, self.grid_size - 1))
-        l_py = int(np.clip(self.leo_pos[1] /
-                   self.pixel_res, 0, self.grid_size - 1))
+        # ch2: LEO footprint
+        lpx = int(np.clip(self.leo_pos[0] /
+                  self.pixel_res, 0, self.grid_size - 1))
+        lpy = int(np.clip(self.leo_pos[1] /
+                  self.pixel_res, 0, self.grid_size - 1))
         y_idx, x_idx = np.ogrid[:self.grid_size, :self.grid_size]
-        dist_from_leo = np.sqrt((x_idx - l_px)**2 + (y_idx - l_py)**2)
+        dist_from_leo = np.sqrt((x_idx - lpx) ** 2 + (y_idx - lpy) ** 2)
         footprint = np.clip(1.0 - (dist_from_leo / 20.0), 0, 1)
-        image_tensor[1] = footprint
+        image[1] = footprint.astype(np.float32)
 
-        # 채널 3: UE trajectory
-        decay_factor = 1.0
-        for pos in reversed(self.trajectory_history):
+        # ch3: trajectory with decay
+        decay = 1.0
+        for pos in reversed(self.trajectory_history[-5:]):
             px = int(np.clip(pos[0] / self.pixel_res, 0, self.grid_size - 1))
             py = int(np.clip(pos[1] / self.pixel_res, 0, self.grid_size - 1))
-            image_tensor[2, px, py] = max(
-                image_tensor[2, px, py], decay_factor)
-            decay_factor *= 0.8
+            image[2, px, py] = max(image[2, px, py], decay)
+            decay *= 0.8
 
-        vector_tensor = np.array([
-            self.current_node / 5.0,
-            self.ue_velocity / 33.3,
-            np.clip((self.current_sinr_db + 20) / 50.0, 0, 1),
-            self.rlf_counter / float(self.N_fail),
-            1.0 if self.current_node == 0 else 0.0
+        # vector
+        # [0] serving node norm
+        # [1] velocity norm (33.3 m/s ~ 120 km/h)
+        # [2] sinr norm
+        # [3] rlf risk (counter/N_fail)
+        # [4] is satellite serving (serving_node==0)
+        sinr_norm = np.clip((self.current_sinr_db + 20.0) / 50.0, 0.0, 1.0)
+        rlf_risk = np.clip(self.rlf_counter / max(self.N_fail, 1), 0.0, 1.0)
+
+        vec = np.array([
+            float(self.serving_node) / 5.0,
+            float(self.ue_velocity) / 33.3,
+            float(sinr_norm),
+            float(rlf_risk),
+            1.0 if self.serving_node == 0 else 0.0
         ], dtype=np.float32)
 
-        return {"image": image_tensor, "vector": vector_tensor}
+        return {"image": image, "vector": vec}
