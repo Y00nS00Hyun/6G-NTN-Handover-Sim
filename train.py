@@ -124,7 +124,8 @@ if __name__ == "__main__":
             done = terminated or truncated
 
             agent.memory.push(state, action, reward, next_state, done)
-            loss = agent.learn()
+            if step_count % 4 == 0:
+                loss = agent.learn()
 
             state = next_state
             total_reward += reward
