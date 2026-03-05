@@ -102,10 +102,10 @@ if __name__ == "__main__":
     env = Hybrid6GEnv()
     agent = DQNAgent()
 
-    num_episodes = 5000
+    num_episodes = 1000
     epsilon_start = 1.0
     epsilon_end = 0.01
-    epsilon_decay = 3000
+    epsilon_decay = 600
     target_update_freq = 10
 
     print(f"\n🚀 [{agent.device}] 장치에서 6G 하이브리드 핸드오버 학습을 시작합니다...\n")
